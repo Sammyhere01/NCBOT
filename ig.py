@@ -1,180 +1,72 @@
-# ==================================
-#        Sammy - Telegram IG Bot
-# ==================================
+# ===============================
+#        Sammy - IG GC Renamer
+# ===============================
 
+import argparse
+import asyncio
 import json
-import os
-import time
-import subprocess
-from telegram import Update
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    ConversationHandler, ContextTypes, filters
-)
+import random
+import re
+from playwright.async_api import async_playwright
 
-BOT_TOKEN = "PASTE_YOUR_TELEGRAM_BOT_TOKEN"
+INVISIBLE_CHARS = ["\u200B", "\u200C", "\u200D", "\u2060"]
 
-SESSIONID = 1
-users_delay = {}  # user_id -> delay seconds
+async def apply_anti_detection(page):
+    await page.evaluate("""() => {
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+        Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
+        window.chrome = { runtime: {} };
+    }""")
 
-# ---------------- Utils ----------------
+async def main():
+    parser = argparse.ArgumentParser("Sammy IG GC Renamer")
+    parser.add_argument("--thread-url", required=True)
+    parser.add_argument("--names", required=True)
+    parser.add_argument("--storage-state", required=True)
+    parser.add_argument("--delay", default="3")
+    parser.add_argument("--headless", default="true")
+    args = parser.parse_args()
 
-def user_file(user_id):
-    return f"user_{user_id}.json"
+    delay = float(args.delay)
+    headless = args.headless.lower() == "true"
+    names_list = [n.strip() for n in re.split(r"[,\n]", args.names) if n.strip()]
 
-def load_user(user_id):
-    if os.path.exists(user_file(user_id)):
-        return json.load(open(user_file(user_id)))
-    return {"accounts": [], "default": None}
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=headless)
+        context = await browser.new_context(storage_state=args.storage_state)
+        page = await context.new_page()
+        await apply_anti_detection(page)
 
-def save_user(user_id, data):
-    with open(user_file(user_id), "w") as f:
-        json.dump(data, f)
+        await page.goto(args.thread_url, timeout=60000)
 
-def storage_from_sessionid(sessionid):
-    return {
-        "cookies": [
-            {
-                "name": "sessionid",
-                "value": sessionid,
-                "domain": ".instagram.com",
-                "path": "/",
-                "httpOnly": True,
-                "secure": True,
-                "sameSite": "Lax",
-                "expires": int(time.time()) + 365*24*3600
-            }
-        ],
-        "origins": [{"origin": "https://www.instagram.com", "localStorage": []}]
-    }
+        await page.wait_for_selector(
+            "div[aria-label='Open the details pane of the chat']",
+            timeout=60000
+        )
+        await page.click("div[aria-label='Open the details pane of the chat']")
 
-# ---------------- Commands ----------------
+        i = 0
+        while True:
+            base = names_list[i % len(names_list)]
+            invis = "".join(
+                random.choice(INVISIBLE_CHARS)
+                for _ in range(random.randint(1, 3))
+            )
+            pos = random.randint(0, len(base))
+            new_name = base[:pos] + invis + base[pos:]
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🔥 *Sammy IG Bot* 🔥\n\n"
-        "/sessionid – Login using cookies\n"
-        "/delay <sec> – Set rename delay\n"
-        "/attack – Start GC rename",
-        parse_mode="Markdown"
-    )
+            try:
+                await page.click("div[aria-label='Change group name']")
+                inp = page.locator("input[aria-label='Group name']")
+                await inp.fill(new_name)
+                await page.click("div:has-text('Save')")
+                print(f"[Sammy] Renamed → {base}")
+            except Exception as e:
+                print("[Sammy ERROR]", e)
 
-# ---- Delay ----
-async def delay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text("Usage: /delay 5")
-        return
-    users_delay[user_id] = int(context.args[0])
-    await update.message.reply_text(
-        f"⏱ Delay set to {users_delay[user_id]} seconds"
-    )
-
-# ---- SessionID Login ----
-async def sessionid_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔐 Send your Instagram sessionid:")
-    return SESSIONID
-
-async def sessionid_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    sessionid = update.message.text.strip()
-
-    state = storage_from_sessionid(sessionid)
-    data = load_user(user_id)
-
-    data["accounts"].append({
-        "ig_username": f"session_{user_id}",
-        "storage_state": state
-    })
-    data["default"] = len(data["accounts"]) - 1
-
-    save_user(user_id, data)
-
-    await update.message.reply_text("✅ SessionID login saved (Sammy)")
-    return ConversationHandler.END
-
-# ---- Attack ----
-async def attack(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    data = load_user(user_id)
-
-    if data["default"] is None:
-        await update.message.reply_text("❌ Login first using /sessionid")
-        return
-
-    await update.message.reply_text(
-        "📝 Send message in this format:\n\n"
-        "GC_URL\n"
-        "name1,name2,name3"
-    )
-    context.user_data["awaiting"] = True
-
-async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get("awaiting"):
-        return
-
-    user_id = update.effective_user.id
-    lines = update.message.text.strip().split("\n", 1)
-
-    if len(lines) != 2:
-        await update.message.reply_text("❌ Invalid format")
-        return
-
-    thread_url = lines[0].strip()
-    names = lines[1].strip()
-
-    data = load_user(user_id)
-    acc = data["accounts"][data["default"]]
-
-    state_file = f"state_{user_id}.json"
-    with open(state_file, "w") as f:
-        json.dump(acc["storage_state"], f)
-
-    delay = users_delay.get(user_id, 3)
-
-    cmd = [
-        "python3", "ig.py",
-        "--thread-url", thread_url,
-        "--names", names,
-        "--delay", str(delay),
-        "--storage-state", state_file
-    ]
-
-    subprocess.Popen(cmd)
-
-    await update.message.reply_text(
-        "💥 GC rename started by *Sammy* 💥",
-        parse_mode="Markdown"
-    )
-
-    context.user_data.clear()
-
-# ---------------- Main ----------------
-
-def main():
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("delay", delay_cmd))
-    app.add_handler(CommandHandler("attack", attack))
-
-    conv = ConversationHandler(
-        entry_points=[CommandHandler("sessionid", sessionid_start)],
-        states={
-            SESSIONID: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, sessionid_save)
-            ]
-        },
-        fallbacks=[]
-    )
-
-    app.add_handler(conv)
-    app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler)
-    )
-
-    print("🔥 Sammy Bot Running 🔥")
-    app.run_polling()
+            i += 1
+            await asyncio.sleep(delay)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
